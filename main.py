@@ -71,7 +71,7 @@ def contains_profanity(text: str) -> bool:
 # تنظیمات
 # ============================================================
 
-TOKEN = os.getenv("BALE_TOKEN", "توکن_بات_را_اینجا_قرار_بده")
+TOKEN = os.getenv("BALE_TOKEN", "910778897:LmrqWY0tz23lwohVxW_-jKj9EWtXRRNHoS8")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 BOT_NAME = "بات علوم 802 سید رضی"
 ROOT = Path(__file__).resolve().parent
