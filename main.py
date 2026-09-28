@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,7 @@ from moderation import contains_profanity
 # تنظیمات
 # ============================================================
 
-TOKEN = os.getenv("BALE_TOKEN", "910778897:LmrqWY0tz23lwohVxW_-jKj9EWtXRRNHoS8")
+TOKEN = os.getenv("BALE_TOKEN", "توکن_بات_را_اینجا_قرار_بده")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 BOT_NAME = "بات علوم 802 سید رضی"
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +48,15 @@ SAMPLE_PDF_DIR = ROOT / "pdfs" / "samples"
 MUTE_SECONDS = 5 * 24 * 60 * 60  # پنج روز
 FIGHT_WINDOW = 120  # دو دقیقه برای تشخیص تعامل تهاجمی دو نفره
 ADMIN_CACHE_TTL = 60
+PENALTY_DAY = 24 * 60 * 60
+
+DEFAULT_LOCKS = {
+    "link": True,
+    "profanity": True,
+    "fight": True,
+    "sticker": True,
+    "gif": True,
+}
 
 # 15 فصل علوم تجربی پایه هشتم
 LESSONS = {
@@ -135,6 +145,11 @@ def user_display(user: dict[str, Any] | None) -> str:
     return name
 
 
+def format_until(timestamp: int) -> str:
+    dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone()
+    return dt.strftime("%Y/%m/%d ساعت %H:%M")
+
+
 def user_id(user: dict[str, Any] | None) -> int | None:
     value = (user or {}).get("id")
     try:
@@ -154,6 +169,8 @@ class Store:
         self.data: dict[str, Any] = {
             "admins": [],
             "active_groups": {},
+            "group_locks": {},
+            "penalties": {},
         }
 
     def load(self) -> None:
@@ -169,6 +186,10 @@ class Store:
                 raise ValueError("data.json is not an object")
             self.data.setdefault("admins", [])
             self.data.setdefault("active_groups", {})
+            self.data.setdefault("group_locks", {})
+            self.data.setdefault("penalties", {})
+            for gid in self.data["active_groups"]:
+                self.data["group_locks"].setdefault(gid, dict(DEFAULT_LOCKS))
         except Exception:
             # فایل خراب را از بین نمی‌بریم؛ یک ساختار سالم می‌سازیم.
             backup = self.path.with_suffix(".broken.json")
@@ -176,7 +197,7 @@ class Store:
                 self.path.replace(backup)
             except Exception:
                 pass
-            self.data = {"admins": [], "active_groups": {}}
+            self.data = {"admins": [], "active_groups": {}, "group_locks": {}, "penalties": {}}
             self.path.write_text(
                 json.dumps(self.data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -216,6 +237,37 @@ class Store:
             ids.append(uid)
             self.data["admins"] = ids
             await self.save()
+
+    def locks(self, chat_id: int | str) -> dict[str, bool]:
+        gid = str(chat_id)
+        self.data.setdefault("group_locks", {})
+        current = self.data["group_locks"].setdefault(gid, dict(DEFAULT_LOCKS))
+        for key, value in DEFAULT_LOCKS.items():
+            current.setdefault(key, value)
+        return current
+
+    async def set_lock(self, chat_id: int | str, key: str, value: bool) -> None:
+        self.locks(chat_id)[key] = bool(value)
+        await self.save()
+
+    def get_penalty(self, chat_id: int | str, uid: int) -> dict[str, Any] | None:
+        return self.data.get("penalties", {}).get(str(chat_id), {}).get(str(uid))
+
+    async def set_penalty(self, chat_id: int | str, uid: int, until: int, reason: str) -> None:
+        gid = str(chat_id)
+        self.data.setdefault("penalties", {}).setdefault(gid, {})[str(uid)] = {
+            "until": int(until),
+            "reason": reason,
+        }
+        await self.save()
+
+    async def remove_penalty(self, chat_id: int | str, uid: int) -> bool:
+        gid = str(chat_id)
+        penalties = self.data.setdefault("penalties", {}).setdefault(gid, {})
+        existed = str(uid) in penalties
+        penalties.pop(str(uid), None)
+        await self.save()
+        return existed
 
 
 # ============================================================
@@ -386,6 +438,43 @@ def main_keyboard() -> dict[str, Any]:
     }
 
 
+def private_panel_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [btn("📖 راهنمای دستورات", "guide")],
+            [btn("🛡 پنل گروه‌ها", "groups")],
+            [btn("🔇 حذف سکوت کاربر", "remove_mute_help")],
+            [btn("📚 دریافت فایل‌ها", "home")],
+        ]
+    }
+
+
+def guide_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [btn("🛡 راهنمای قفل‌ها", "guide:locks")],
+            [btn("⚙️ دستورات مدیریت", "guide:commands")],
+            [btn("🔙 پنل", "panel")],
+        ]
+    }
+
+
+def group_panel_keyboard(chat_id: int | str, locks: dict[str, bool]) -> dict[str, Any]:
+    labels = {
+        "link": "🔗 قفل لینک",
+        "profanity": "🤬 قفل فحش",
+        "fight": "⚠️ قفل بحث",
+        "sticker": "🎭 قفل استیکر",
+        "gif": "🎞 قفل GIF",
+    }
+    rows = []
+    for key in ("link", "profanity", "fight", "sticker", "gif"):
+        state = "✅ روشن" if locks.get(key, True) else "❌ خاموش"
+        rows.append([btn(f"{labels[key]}: {state}", f"toggle:{chat_id}:{key}")])
+    rows.append([btn("🔙 پنل", "panel")])
+    return {"inline_keyboard": rows}
+
+
 def lessons_keyboard() -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
     row: list[dict[str, str]] = []
@@ -503,12 +592,14 @@ class ScienceBot:
 
         can_mod, reason = await self.bot_can_moderate(int(chat_id))
         if not can_mod:
+            # اگر فقط محدودکردن اعضا در دسترس نباشد، بات هنوز می‌تواند با حذف پیام و محرومیت داخلی کار کند.
+            if "دسترسی حذف پیام" in reason:
+                await self.safe_send(chat_id, f"❌ بات دسترسی حذف پیام ندارد.\n\nدلیل: {reason}")
+                return
             await self.safe_send(
                 chat_id,
-                "❌ برای فعال‌سازی، بات باید مدیر باشد و دسترسی حذف پیام و محدود کردن اعضا را داشته باشد.\n\n"
-                f"دلیل: {reason}",
+                "⚠️ دسترسی محدودکردن اعضا برای بات فعال نیست؛ بات با سیستم محرومیت داخلی و حذف پیام ادامه می‌دهد.",
             )
-            return
 
         await self.store.set_active(chat_id, True)
         await self.safe_send(chat_id, "✅ بات علوم 802 سید رضی فعال شد.\nنظارت گروه شروع شد.")
@@ -552,11 +643,42 @@ class ScienceBot:
             )
             return
 
+        if text == "پنل" or text == "/panel":
+            if self.store.is_admin(uid):
+                await self.safe_send(chat_id, "🛡 پنل مدیریت بات", reply_markup=private_panel_keyboard())
+            else:
+                await self.safe_send(chat_id, "❌ این پنل فقط برای مدیر ثبت‌شده است.")
+            return
+
+        if text == "راهنما" or text == "/help":
+            await self.safe_send(chat_id, "📖 راهنمای بات\nنوع راهنما را انتخاب کنید:", reply_markup=guide_keyboard())
+            return
+
+        # حذف سکوت 123456789 / حذف سکوت: 123456789
+        m = re.match(r"^حذف\s*سکوت\s*[: ]\s*(\d+)$", text)
+        if m:
+            if not self.store.is_admin(uid):
+                await self.safe_send(chat_id, "❌ فقط مدیر ثبت‌شده می‌تواند سکوت را حذف کند.")
+                return
+            target = int(m.group(1))
+            removed = False
+            for gid in list(self.store.data.get("penalties", {}).keys()):
+                if str(target) in self.store.data["penalties"].get(gid, {}):
+                    await self.store.remove_penalty(gid, target)
+                    removed = True
+                    try:
+                        await self.api.restrict_chat_member(int(gid), target, int(time.time()) + 5)
+                    except Exception:
+                        pass
+            await self.safe_send(chat_id, "✅ سکوت کاربر حذف شد." if removed else "ℹ️ برای این ID محرومیت ذخیره‌شده‌ای پیدا نشد.")
+            return
+
+        if text == "دریافت":
+            await self.safe_send(chat_id, "📚 برای دریافت فایل‌ها /start را بزنید.", reply_markup=main_keyboard())
+            return
+
         if text == "/status":
-            await self.safe_send(
-                chat_id,
-                f"وضعیت بات: ✅ فعال\nادمین ثبت‌شده: {self.store.is_admin(uid)}\nگروه‌های فعال: {sum(1 for x in self.store.data.get('active_groups', {}).values() if x)}",
-            )
+            await self.safe_send(chat_id, f"وضعیت بات: ✅ فعال\nادمین ثبت‌شده: {self.store.is_admin(uid)}\nگروه‌های فعال: {sum(1 for x in self.store.data.get('active_groups', {}).values() if x)}")
             return
 
     async def handle_callback(self, cq: dict[str, Any]) -> None:
@@ -577,6 +699,84 @@ class ScienceBot:
         if chat.get("type") != "private" or chat_id is None or msg_id is None:
             return
         if uid is None:
+            return
+
+        if data == "panel":
+            if not self.store.is_admin(uid):
+                return
+            await self.api.edit_message_text(chat_id, msg_id, "🛡 پنل مدیریت بات", private_panel_keyboard())
+            return
+
+        if data == "guide":
+            await self.api.edit_message_text(chat_id, msg_id, "📖 راهنما\nنوع راهنما را انتخاب کنید:", guide_keyboard())
+            return
+
+        if data == "guide:locks":
+            text = (
+                "🛡 راهنمای قفل‌ها\n\n"
+                "🔗 قفل لینک: حذف پیام دارای لینک\n"
+                "🤬 قفل فحش: حذف + محرومیت\n"
+                "⚠️ قفل بحث: حذف + محرومیت در پیام‌های تهاجمی\n"
+                "🎭 قفل استیکر: حذف استیکر\n"
+                "🎞 قفل GIF: حذف GIF\n\n"
+                "هرکدام را می‌توانی از پنل روشن/خاموش کنی."
+            )
+            await self.api.edit_message_text(chat_id, msg_id, text, guide_keyboard())
+            return
+
+        if data == "guide:commands":
+            text = (
+                "⚙️ دستورات مدیریت\n\n"
+                "فعال — فعال‌سازی بات در گروه\n"
+                "راهنما — راهنمای قفل‌ها و دستورات\n"
+                "پنل — پنل شیشه‌ای مدیریت\n"
+                "حذف سکوت ID — حذف محرومیت کاربر\n"
+                "/admin — ثبت ادمین اولیه در PV\n"
+                "/stats — آمار گروه\n"
+                "/deactivate — غیرفعال‌سازی گروه"
+            )
+            await self.api.edit_message_text(chat_id, msg_id, text, guide_keyboard())
+            return
+
+        if data == "remove_mute_help":
+            await self.api.edit_message_text(chat_id, msg_id, "برای حذف سکوت بنویس:\n\nحذف سکوت ID\n\nمثال: حذف سکوت 123456789", private_panel_keyboard())
+            return
+
+        if data == "groups":
+            if not self.store.is_admin(uid):
+                return
+            active = [str(g) for g, v in self.store.data.get("active_groups", {}).items() if v]
+            rows = [[btn(f"گروه {g}", f"group:{g}")] for g in active[:20]]
+            if not rows:
+                rows = [[btn("گروه فعالی ثبت نشده", "panel")]]
+            else:
+                rows.append([btn("🔙 پنل", "panel")])
+            await self.api.edit_message_text(chat_id, msg_id, "🛡 گروه موردنظر را انتخاب کنید:", {"inline_keyboard": rows})
+            return
+
+        if data.startswith("group:"):
+            if not self.store.is_admin(uid):
+                return
+            gid = data.split(":", 1)[1]
+            try:
+                gid_int = int(gid)
+            except ValueError:
+                return
+            await self.api.edit_message_text(chat_id, msg_id, f"⚙️ تنظیمات گروه {gid}", group_panel_keyboard(gid_int, self.store.locks(gid_int)))
+            return
+
+        if data.startswith("toggle:"):
+            if not self.store.is_admin(uid):
+                return
+            parts = data.split(":")
+            if len(parts) != 3:
+                return
+            gid, key = parts[1], parts[2]
+            if key not in DEFAULT_LOCKS:
+                return
+            current = self.store.locks(gid).get(key, True)
+            await self.store.set_lock(gid, key, not current)
+            await self.api.edit_message_text(chat_id, msg_id, f"⚙️ تنظیمات گروه {gid}", group_panel_keyboard(gid, self.store.locks(gid)))
             return
 
         if data == "home":
@@ -652,14 +852,28 @@ class ScienceBot:
         uid = user_id(message.get("from"))
         if chat_id is None or uid is None:
             return
+        now = int(time.time())
+        old = self.store.get_penalty(chat_id, uid)
+        until = max(now, int(old.get("until", 0)) if old else now) + MUTE_SECONDS
+        await self.store.set_penalty(chat_id, uid, until, reason)
+
+        api_mute_ok = True
         try:
-            until = int(time.time()) + MUTE_SECONDS
-            await self.api.restrict_chat_member(int(chat_id), uid, until)
+            await self.api.restrict_chat_member(chat_id, uid, until)
         except Exception as exc:
+            api_mute_ok = False
             print("restrictChatMember error:", exc)
-            await self.report(message, reason, "⚠️ حذف انجام شد، اما سکوت ۵ روزه اجرا نشد؛ دسترسی API را بررسی کنید.")
-            return
-        await self.report(message, reason, "🔇 مدت سکوت: ۵ روز")
+
+        await self.report(
+            message,
+            reason,
+            f"🔇 محرومیت تا {format_until(until)}" + ("" if api_mute_ok else "\n⚠️ API نتوانست دسترسی را ببندد؛ محرومیت داخلی فعال شد."),
+        )
+        await self.safe_send(
+            chat_id,
+            f"⚠️ کاربر {user_display(message.get('from'))} به دلیل {reason} تا {format_until(until)} محروم شد.\n\nبرای حذف سکوت با رادین یا استاد اطلاع دهید.\nهر پیام در زمان محرومیت، یک روز به مدت تنبیه اضافه می‌کند.",
+        )
+
 
     async def moderate_group_message(self, message: dict[str, Any]) -> None:
         chat = message.get("chat") or {}
@@ -683,12 +897,33 @@ class ScienceBot:
         if uid in admins:
             return
 
+        locks = self.store.locks(chat_id)
+
+        # کاربر محروم: پیام حذف می‌شود و هر پیام جدید یک روز به محرومیت اضافه می‌کند.
+        penalty = self.store.get_penalty(chat_id, uid)
+        if penalty:
+            now = int(time.time())
+            if int(penalty.get("until", 0)) > now:
+                new_until = int(penalty["until"]) + PENALTY_DAY
+                await self.store.set_penalty(chat_id, uid, new_until, penalty.get("reason", "تخلف"))
+                try:
+                    await self.api.delete_message(chat_id, int(message.get("message_id")))
+                except Exception:
+                    pass
+                await self.safe_send(
+                    chat_id,
+                    f"⚠️ کاربر {user_display(sender)} شما تا {format_until(new_until)} به دلیل {penalty.get('reason', 'تخلف')} محرومید.\n\nبرای حذف سکوت با رادین یا استاد اطلاع دهید.\nهر پیام در زمان محرومیت، یک روز به مدت تنبیه اضافه می‌کند.",
+                )
+                return
+            else:
+                await self.store.remove_penalty(chat_id, uid)
+
         message_id = message.get("message_id")
         if message_id is None:
             return
 
         # لینک
-        if has_link(message):
+        if locks.get("link", True) and has_link(message):
             try:
                 await self.api.delete_message(chat_id, int(message_id))
             except Exception as exc:
@@ -697,7 +932,7 @@ class ScienceBot:
             return
 
         # استیکر
-        if message.get("sticker") is not None:
+        if locks.get("sticker", True) and message.get("sticker") is not None:
             try:
                 await self.api.delete_message(chat_id, int(message_id))
             except Exception as exc:
@@ -706,7 +941,7 @@ class ScienceBot:
             return
 
         # GIF / Animation
-        if message.get("animation") is not None:
+        if locks.get("gif", True) and message.get("animation") is not None:
             try:
                 await self.api.delete_message(chat_id, int(message_id))
             except Exception as exc:
@@ -715,10 +950,10 @@ class ScienceBot:
             return
 
         text = normalize_text(message.get("text") or message.get("caption") or "")
-        bad = contains_profanity(text)
-        aggressive = contains_any(text, FIGHT_WORDS)
+        bad = locks.get("profanity", True) and contains_profanity(text)
+        aggressive = locks.get("fight", True) and contains_any(text, FIGHT_WORDS)
 
-        # فحش یا پیام تهاجمی: حذف + سکوت ۵ روز
+        # فحش یا پیام تهاجمی: حذف + محرومیت ۵ روز
         if bad or aggressive:
             reason = "فحش" if bad else "پیام تهاجمی / بحث"
             try:
@@ -736,10 +971,13 @@ class ScienceBot:
                 if previous_uid != uid and now - previous_time <= FIGHT_WINDOW:
                     # کاربر قبلی را هم محدود کن.
                     try:
+                        previous_penalty = self.store.get_penalty(chat_id, previous_uid)
+                        previous_until = max(int(now), int(previous_penalty.get("until", 0)) if previous_penalty else int(now)) + MUTE_SECONDS
+                        await self.store.set_penalty(chat_id, previous_uid, previous_until, "درگیری / بحث دو نفره")
                         await self.api.restrict_chat_member(
                             chat_id,
                             previous_uid,
-                            int(now) + MUTE_SECONDS,
+                            previous_until,
                         )
                         await self.safe_send(
                             self.store.admins()[0] if self.store.admins() else uid,
@@ -770,6 +1008,15 @@ class ScienceBot:
         if chat_type in {"group", "supergroup"}:
             if text == "فعال":
                 await self.activate_group(message)
+                return
+            if text == "راهنما":
+                await self.safe_send(chat.get("id"), "📖 راهنما\nبرای پنل مدیریت، دستور «پنل» را بفرستید.\nبرای راهنمای کامل در PV بات /start را بزنید.")
+                return
+            if text == "پنل":
+                uid = user_id(message.get("from"))
+                admins = await self.get_group_admin_ids(int(chat.get("id")))
+                if uid in admins:
+                    await self.safe_send(chat.get("id"), "🛡 پنل تنظیم قفل‌ها\nتنظیمات کامل در PV بات در دسترس است.")
                 return
             await self.moderate_group_message(message)
             return
