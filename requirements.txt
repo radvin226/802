@@ -1,2 +1,2 @@
-aiohttp>=3.9,<4
-safetext>=0.3.3
+aiohttp>=3.10.0
+safetext>=0.1.0
