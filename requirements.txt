@@ -1,0 +1,2 @@
+aiohttp>=3.9,<4
+safetext>=0.3.3
