@@ -30,7 +30,41 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from moderation import contains_profanity
+
+
+
+
+# ============================================================
+# فیلتر چندزبانه داخل همان main.py
+# ============================================================
+try:
+    from safetext import SafeText
+except ImportError:
+    SafeText = None
+
+_SUPPORTED_LANGUAGES = (
+    "fa", "en", "ar", "az", "de", "es", "fr", "hi",
+    "ja", "pt", "ru", "tr", "zh",
+)
+
+def contains_profanity(text: str) -> bool:
+    if not text or not text.strip() or SafeText is None:
+        return False
+    try:
+        auto = SafeText(language=None)
+        auto.set_language_from_text(text)
+        detected = getattr(auto, "language", None)
+        if detected in _SUPPORTED_LANGUAGES and SafeText(language=detected).check_profanity(text=text):
+            return True
+    except Exception:
+        pass
+    for language in ("fa", "en", "ar"):
+        try:
+            if SafeText(language=language).check_profanity(text=text):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 # ============================================================
@@ -41,7 +75,6 @@ TOKEN = os.getenv("BALE_TOKEN", "توکن_بات_را_اینجا_قرار_بده
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 BOT_NAME = "بات علوم 802 سید رضی"
 ROOT = Path(__file__).resolve().parent
-DATA_FILE = ROOT / "data.json"
 TEXT_PDF_DIR = ROOT / "pdfs" / "text"
 SAMPLE_PDF_DIR = ROOT / "pdfs" / "samples"
 
@@ -163,8 +196,7 @@ def user_id(user: dict[str, Any] | None) -> int | None:
 # ============================================================
 
 class Store:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, path: Path | None = None):
         self.lock = asyncio.Lock()
         self.data: dict[str, Any] = {
             "admins": [],
@@ -174,43 +206,12 @@ class Store:
         }
 
     def load(self) -> None:
-        if not self.path.exists():
-            self.path.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            return
-        try:
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(self.data, dict):
-                raise ValueError("data.json is not an object")
-            self.data.setdefault("admins", [])
-            self.data.setdefault("active_groups", {})
-            self.data.setdefault("group_locks", {})
-            self.data.setdefault("penalties", {})
-            for gid in self.data["active_groups"]:
-                self.data["group_locks"].setdefault(gid, dict(DEFAULT_LOCKS))
-        except Exception:
-            # فایل خراب را از بین نمی‌بریم؛ یک ساختار سالم می‌سازیم.
-            backup = self.path.with_suffix(".broken.json")
-            try:
-                self.path.replace(backup)
-            except Exception:
-                pass
-            self.data = {"admins": [], "active_groups": {}, "group_locks": {}, "penalties": {}}
-            self.path.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+        # اطلاعات این نسخه فقط در حافظه نگه‌داری می‌شود تا پروژه فقط main.py، requirements.txt و pdfs داشته باشد.
+        return
 
     async def save(self) -> None:
-        async with self.lock:
-            temp = self.path.with_suffix(".tmp")
-            temp.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temp.replace(self.path)
+        # عمداً فایل جانبی ساخته نمی‌شود.
+        return
 
     def is_admin(self, uid: int | None) -> bool:
         return uid is not None and int(uid) in {int(x) for x in self.data.get("admins", [])}
@@ -1062,7 +1063,7 @@ async def main() -> None:
         )
 
     api = BaleAPI(TOKEN)
-    store = Store(DATA_FILE)
+    store = Store()
     bot = ScienceBot(api, store)
     await bot.run()
 
